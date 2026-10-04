@@ -1089,15 +1089,41 @@ jobs:
             # 再直接用 crane ls 从 GHCR 读取真实标签，不依赖 Packages REST 权限。
             WEB_PACKAGES="${WORK}/web-packages.txt"
             :>"${WEB_PACKAGES}"
+            PACKAGE_PAGE_BASE=""
+            for candidate_base in \
+              "https://github.com/users/${OWNER}/packages" \
+              "https://github.com/orgs/${OWNER}/packages" \
+              "https://github.com/${OWNER}"; do
+              if [[ "${candidate_base}" == "https://github.com/${OWNER}" ]]; then
+                candidate_url="${candidate_base}?tab=packages&repo_name=${REPO_NAME}"
+              else
+                candidate_url="${candidate_base}?repo_name=${REPO_NAME}"
+              fi
+              CODE="$(curl -sS -L -o "${WORK}/packages-probe.html" -w '%{http_code}' -H 'Accept: text/html' -A 'Mozilla/5.0' "${candidate_url}")"
+              if [ "${CODE}" = 200 ] && grep -qiE '/(users|orgs)/[^/]+/packages/container/(package/)?' "${WORK}/packages-probe.html"; then
+                PACKAGE_PAGE_BASE="${candidate_base}"
+                echo "公开 Packages 页面可用：${candidate_url}"
+                break
+              fi
+              echo "Packages 页面探测未命中：HTTP ${CODE} ${candidate_url}"
+            done
             if [ "${PACKAGES_OK}" != true ]; then
               echo "REST API 不可用，开始抓取公开 Packages 网页。"
+              if [ -z "${PACKAGE_PAGE_BASE}" ]; then
+                echo "::warning::未探测到可用的公开 Packages 页面入口。"
+              fi
               for page in $(seq 1 50); do
-                PAGE_URL="https://github.com/orgs/${OWNER}/packages?repo_name=${REPO_NAME}&page=${page}"
+                [ -n "${PACKAGE_PAGE_BASE}" ] || break
+                if [[ "${PACKAGE_PAGE_BASE}" == "https://github.com/${OWNER}" ]]; then
+                  PAGE_URL="${PACKAGE_PAGE_BASE}?tab=packages&repo_name=${REPO_NAME}&page=${page}"
+                else
+                  PAGE_URL="${PACKAGE_PAGE_BASE}?repo_name=${REPO_NAME}&page=${page}"
+                fi
                 CODE="$(curl -sS -L -o "${WORK}/packages-page.html" -w '%{http_code}' \
                   -H 'Accept: text/html' -A 'Mozilla/5.0' "${PAGE_URL}")"
                 [ "${CODE}" = 200 ] || { echo "Packages 网页 HTTP ${CODE}：${PAGE_URL}"; break; }
                 HTML_FILE="${WORK}/packages-page.html" OWNER_VALUE="${OWNER}" REPO_VALUE="${REPO_NAME}" \
-                  python3 -c 'import html,os,re; from pathlib import Path; from urllib.parse import unquote; text=html.unescape(Path(os.environ["HTML_FILE"]).read_text(encoding="utf-8",errors="ignore")); owner=os.environ["OWNER_VALUE"]; repo=os.environ["REPO_VALUE"]; pattern=rf"/{re.escape(owner)}/{re.escape(repo)}/pkgs/container/([^\"?#< ]+)"; print("\n".join(unquote(x).strip("/") for x in re.findall(pattern,text,re.I) if unquote(x).strip("/")))' \
+                  python3 -c 'import html,os,re; from pathlib import Path; from urllib.parse import unquote; text=html.unescape(Path(os.environ["HTML_FILE"]).read_text(encoding="utf-8",errors="ignore")); owner=os.environ["OWNER_VALUE"]; repo=os.environ["REPO_VALUE"]; pattern=rf"/(?:users|orgs)/{re.escape(owner)}/packages/container/(?:package/)?([^\"?#< ]+)"; print("\n".join(unquote(x).strip("/") for x in re.findall(pattern,text,re.I) if unquote(x).strip("/")))' \
                   >> "${WEB_PACKAGES}"
                 COUNT="$(sort -u "${WEB_PACKAGES}" | wc -l | xargs)"
                 echo "Packages 网页第 ${page} 页，累计发现 ${COUNT} 个包。"
@@ -1135,11 +1161,16 @@ jobs:
               if [ "${FOUND_PACKAGES}" -eq 0 ]; then
                 echo "::warning::Packages API 返回成功但没有关联包，补充抓取公开 Packages 网页。"
                 for page in $(seq 1 50); do
-                  PAGE_URL="https://github.com/orgs/${OWNER}/packages?repo_name=${REPO_NAME}&page=${page}"
+                  [ -n "${PACKAGE_PAGE_BASE}" ] || break
+                  if [[ "${PACKAGE_PAGE_BASE}" == "https://github.com/${OWNER}" ]]; then
+                  PAGE_URL="${PACKAGE_PAGE_BASE}?tab=packages&repo_name=${REPO_NAME}&page=${page}"
+                else
+                  PAGE_URL="${PACKAGE_PAGE_BASE}?repo_name=${REPO_NAME}&page=${page}"
+                fi
                   CODE="$(curl -sS -L -o "${WORK}/packages-page.html" -w '%{http_code}' -H 'Accept: text/html' -A 'Mozilla/5.0' "${PAGE_URL}")"
                   [ "${CODE}" = 200 ] || break
                   HTML_FILE="${WORK}/packages-page.html" OWNER_VALUE="${OWNER}" REPO_VALUE="${REPO_NAME}" \
-                    python3 -c 'import html,os,re; from pathlib import Path; from urllib.parse import unquote; text=html.unescape(Path(os.environ["HTML_FILE"]).read_text(encoding="utf-8",errors="ignore")); owner=os.environ["OWNER_VALUE"]; repo=os.environ["REPO_VALUE"]; pattern=rf"/{re.escape(owner)}/{re.escape(repo)}/pkgs/container/([^\"?#< ]+)"; print("\n".join(unquote(x).strip("/") for x in re.findall(pattern,text,re.I) if unquote(x).strip("/")))' \
+                    python3 -c 'import html,os,re; from pathlib import Path; from urllib.parse import unquote; text=html.unescape(Path(os.environ["HTML_FILE"]).read_text(encoding="utf-8",errors="ignore")); owner=os.environ["OWNER_VALUE"]; repo=os.environ["REPO_VALUE"]; pattern=rf"/(?:users|orgs)/{re.escape(owner)}/packages/container/(?:package/)?([^\"?#< ]+)"; print("\n".join(unquote(x).strip("/") for x in re.findall(pattern,text,re.I) if unquote(x).strip("/")))' \
                     >> "${WEB_PACKAGES}"
                   grep -qiE 'Next|下一页' "${WORK}/packages-page.html" || break
                 done
