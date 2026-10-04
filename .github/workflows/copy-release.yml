@@ -82,7 +82,7 @@ on:
           - selected
 
       image_mappings:
-        description: "Docker 映射：留空自动扫描上游项目；手动格式 源=目标|用户名|Token；多个用分号"
+        description: "Docker 映射：留空自动扫描上游源码与 GitHub Packages；手动格式 源=目标|用户名|Token"
         required: false
         type: string
         default: ""
@@ -445,17 +445,14 @@ jobs:
           OUTPUT_FILE="${RUNNER_TEMP}/docker-versions-ordered.json"
           ORDER_FILE="${RUNNER_TEMP}/docker-versions-order.txt"
           printf '%s' "${SELECTED_JSON}" > "${INPUT_FILE}"
-          jq -e 'type=="array" and length>0' "${INPUT_FILE}" >/dev/null             || { echo "::error::没有可供 Docker 使用的版本"; exit 1; }
+          jq -e 'type=="array" and length>0' "${INPUT_FILE}" >/dev/null || { echo "::error::没有可供 Docker 使用的版本"; exit 1; }
           if [ "${SOURCE_KIND}" = "github" ] && [ "${TAG_SYNC_MODE}" = "clean_snapshot" ]; then
             jq -r '.[].tagName' "${INPUT_FILE}" | sort -V > "${ORDER_FILE}"
-            jq --rawfile tags "${ORDER_FILE}" '
-              ($tags|split("\n")|map(select(length>0))|to_entries|map({key:.value,value:.key})|from_entries) as $order
-              | sort_by($order[.tagName])
-            ' "${INPUT_FILE}" > "${OUTPUT_FILE}"
+            jq --rawfile tags "${ORDER_FILE}" '($tags|split("\n")|map(select(length>0))|to_entries|map({key:.value,value:.key})|from_entries) as $order | sort_by($order[.tagName])' "${INPUT_FILE}" > "${OUTPUT_FILE}"
             echo "clean_snapshot 已作用于 Docker：按自然版本号从旧到新排序。"
           else
             jq '.' "${INPUT_FILE}" > "${OUTPUT_FILE}"
-            echo "Docker 保持原版本选择顺序：source_kind=${SOURCE_KIND}，tag_sync_mode=${TAG_SYNC_MODE}。"
+            echo "Docker 保持原版本选择顺序。"
           fi
           echo "Docker 最终处理顺序："
           jq -r '.[].tagName' "${OUTPUT_FILE}" | nl -ba
@@ -988,102 +985,94 @@ jobs:
           echo "${HOME}/go/bin" >> "${GITHUB_PATH}"
           "${HOME}/go/bin/crane" version
 
-      - name: Docker 地址为空时自动查找上游项目镜像
+      - name: Docker 地址为空时自动查找源码镜像与 GitHub Packages
         id: discover_images
         if: ${{ inputs.image_mappings == '' }}
         shell: bash
         run: |
           set -euo pipefail
-          [ "${SOURCE_REPO}" != "none" ] || { echo "::error::src_repo=none 无上游源码可扫描，请填写 image_mappings"; exit 1; }
-          WORK="$(mktemp -d)"
-          SRC_DIR="${WORK}/source"
-          OUT="${RUNNER_TEMP}/auto-image-mappings.tsv"
+          [ "${SOURCE_REPO}" != "none" ] || { echo "::error::src_repo=none 无上游可扫描，请填写 image_mappings"; exit 1; }
+          WORK="$(mktemp -d)"; SRC_DIR="${WORK}/source"; OUT="${RUNNER_TEMP}/auto-image-mappings.tsv"
+          COMPOSE_OUT="${RUNNER_TEMP}/compose-image-mappings.tsv"; PACKAGE_OUT="${RUNNER_TEMP}/package-image-mappings.tsv"
           trap 'rm -rf "${WORK}"' EXIT
+          :>"${COMPOSE_OUT}"; :>"${PACKAGE_OUT}"
           if [ "${SOURCE_KIND}" = "github" ]; then
-            echo "自动下载 GitHub 上游源码：${SOURCE_REPO}"
             gh api -H 'Accept: application/vnd.github+json' "repos/${SOURCE_REPO}/tarball" > "${WORK}/source.tar.gz"
-            mkdir -p "${SRC_DIR}"
-            tar -xzf "${WORK}/source.tar.gz" -C "${SRC_DIR}" --strip-components=1
+            mkdir -p "${SRC_DIR}"; tar -xzf "${WORK}/source.tar.gz" -C "${SRC_DIR}" --strip-components=1
           elif [ "${SOURCE_KIND}" = "external_git" ]; then
-            echo "自动浅克隆外部 Git 源码：${SOURCE_REPO}"
             git clone --depth 1 "${SOURCE_REPO}" "${SRC_DIR}"
           else
-            echo "::error::当前源类型不支持自动发现 Docker：${SOURCE_KIND}"
-            exit 1
+            echo "::error::当前源类型不支持自动发现：${SOURCE_KIND}"; exit 1
           fi
           python3 -m pip install --disable-pip-version-check --quiet pyyaml
-          python3 - "${SRC_DIR}" "${OUT}" <<'PYCODE'
-          import os, re, sys, yaml
+          python3 - "${SRC_DIR}" "${COMPOSE_OUT}" <<'PYCODE'
+          import re, sys, yaml
           from pathlib import Path
-          root, out = Path(sys.argv[1]), Path(sys.argv[2])
-          images, local_build_images = set(), set()
-          ignored = {'.git','vendor','node_modules','dist','build','.cache'}
-          compose_names = {'compose.yml','compose.yaml','docker-compose.yml','docker-compose.yaml'}
-
-          def normalize(value):
-              if not isinstance(value, str): return None
-              value = value.strip().strip('"').strip("'")
-              if not value or '$' in value: return None
-              value = value.split('@',1)[0]
-              last = value.rsplit('/',1)[-1]
-              if ':' in last: value = value.rsplit(':',1)[0]
-              if '/' not in value: value = 'docker.io/library/' + value
-              elif value.split('/',1)[0] not in ('localhost',) and not any(c in value.split('/',1)[0] for c in '.:'):
-                  value = 'docker.io/' + value
-              return value.lower().strip('/')
-
+          root,out=Path(sys.argv[1]),Path(sys.argv[2]); images=set(); local=set()
+          ignored={'.git','vendor','node_modules','dist','build','.cache'}
+          def norm(v):
+              if not isinstance(v,str): return None
+              v=v.strip().strip('"').strip("'")
+              if not v or '$' in v: return None
+              v=v.split('@',1)[0]; last=v.rsplit('/',1)[-1]
+              if ':' in last: v=v.rsplit(':',1)[0]
+              if '/' not in v: v='docker.io/library/'+v
+              elif not any(c in v.split('/',1)[0] for c in '.:'): v='docker.io/'+v
+              return v.lower().strip('/')
           for path in root.rglob('*'):
-              if not path.is_file() or any(part in ignored for part in path.parts): continue
-              if path.name in compose_names or re.fullmatch(r'(docker-)?compose[^/]*\.ya?ml', path.name, re.I):
-                  try:
-                      data = yaml.safe_load(path.read_text(encoding='utf-8', errors='ignore')) or {}
-                  except Exception as exc:
-                      print(f'warning: Compose 解析失败，已跳过 {path}: {exc}', file=sys.stderr); continue
-                  services = data.get('services') if isinstance(data, dict) else None
-                  if not isinstance(services, dict): continue
-                  for service, config in services.items():
-                      if not isinstance(config, dict): continue
-                      image = normalize(config.get('image'))
-                      if not image: continue
-                      if config.get('build') is not None:
-                          local_build_images.add(image)
-                          print(f'跳过本地 build 镜像：{service} -> {image}', file=sys.stderr)
-                      else:
-                          images.add(image)
-
-          workflow_ref = re.compile(r'(?<![A-Za-z0-9_.-])((?:ghcr\.io|quay\.io|docker\.io)/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+(?::[A-Za-z0-9_.-]+)?)')
-          workflows = root/'.github'/'workflows'
-          if workflows.is_dir():
-              for path in list(workflows.glob('*.yml')) + list(workflows.glob('*.yaml')):
-                  text = path.read_text(encoding='utf-8', errors='ignore')
-                  for match in workflow_ref.findall(text):
-                      image = normalize(match)
-                      if image and image not in local_build_images: images.add(image)
-
-          if not images:
-              repo = os.environ.get('SOURCE_REPO','').lower()
-              if re.fullmatch(r'[a-z0-9_.-]+/[a-z0-9_.-]+', repo):
-                  images.add('ghcr.io/' + repo)
-                  print('未在配置中发现字面量镜像，回退到上游仓库同名 GHCR 镜像。', file=sys.stderr)
-
-          rows, targets = [], {}
-          for image in sorted(images):
-              target = re.sub(r'[^a-z0-9._-]+','-',image.rsplit('/',1)[-1]).strip('._-')
-              if not target: continue
-              if target in targets and targets[target] != image:
-                  raise SystemExit(f'自动发现目标名冲突：{targets[target]} 与 {image} 都映射为 {target}；请手动填写 image_mappings')
-              targets[target] = image
-              rows.append((image,target))
-          if not rows: raise SystemExit('未从上游项目发现可搬运的远程 Docker 镜像，请填写 image_mappings')
+              if not path.is_file() or any(x in ignored for x in path.parts): continue
+              if re.fullmatch(r'(docker-)?compose[^/]*\.ya?ml',path.name,re.I):
+                  try: data=yaml.safe_load(path.read_text(encoding='utf-8',errors='ignore')) or {}
+                  except Exception as e: print(f'warning: skip {path}: {e}',file=sys.stderr); continue
+                  services=data.get('services') if isinstance(data,dict) else None
+                  if not isinstance(services,dict): continue
+                  for name,cfg in services.items():
+                      if not isinstance(cfg,dict): continue
+                      img=norm(cfg.get('image'))
+                      if not img: continue
+                      if cfg.get('build') is not None: local.add(img); print(f'跳过本地 build 镜像：{name} -> {img}',file=sys.stderr)
+                      else: images.add(img)
+          pat=re.compile(r'(?<![A-Za-z0-9_.-])((?:ghcr\.io|quay\.io|docker\.io)/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+(?::[A-Za-z0-9_.-]+)?)')
+          wf=root/'.github'/'workflows'
+          if wf.is_dir():
+              for path in list(wf.glob('*.yml'))+list(wf.glob('*.yaml')):
+                  for raw in pat.findall(path.read_text(encoding='utf-8',errors='ignore')):
+                      img=norm(raw)
+                      if img and img not in local: images.add(img)
+          targets={}
           with out.open('w',encoding='utf-8') as f:
-              for image,target in rows: f.write(f'{image}\t{target}\n')
-          print(f'自动发现远程镜像数量：{len(rows)}')
-          for image,target in rows: print(f'  {image} -> ghcr.io/<当前所有者>/{target}')
+              for img in sorted(images):
+                  target=re.sub(r'[^a-z0-9._-]+','-',img.rsplit('/',1)[-1]).strip('._-')
+                  if target in targets and targets[target]!=img: raise SystemExit(f'目标名冲突：{targets[target]} / {img} -> {target}')
+                  targets[target]=img; f.write(f'{img}\t{target}\t\n')
           PYCODE
-          [ -s "${OUT}" ] || { echo "::error::自动发现没有生成镜像映射"; exit 1; }
+
+          if [ "${SOURCE_KIND}" = "github" ]; then
+            OWNER="${SOURCE_REPO%%/*}"; OWNER_TYPE="$(gh api "repos/${SOURCE_REPO}" --jq '.owner.type')"
+            if [ "${OWNER_TYPE}" = "Organization" ]; then PKG_ENDPOINT="/orgs/${OWNER}/packages"; else PKG_ENDPOINT="/users/${OWNER}/packages"; fi
+            if gh api --paginate --slurp "${PKG_ENDPOINT}?package_type=container&per_page=100" > "${WORK}/packages.json" 2>"${WORK}/packages.err"; then
+              jq -c --arg repo "${SOURCE_REPO}" '[.[][] | select((.repository.full_name // "") == $repo)] | unique_by(.name) | .[]' "${WORK}/packages.json" | while IFS= read -r package; do
+                NAME="$(jq -r '.name' <<<"${package}")"; ENCODED="$(jq -rn --arg v "${NAME}" '$v|@uri')"
+                if gh api --paginate --slurp "${PKG_ENDPOINT}/container/${ENCODED}/versions?per_page=100" > "${WORK}/versions.json" 2>/dev/null; then
+                  TAGS="$(jq -r '[.[][] | .metadata.container.tags[]?] | unique | sort_by(if .=="latest" then "zzzzzz" else . end) | join(",")' "${WORK}/versions.json")"
+                  [ -n "${TAGS}" ] || { echo "GitHub Package 无标签，跳过：${NAME}"; continue; }
+                  SOURCE_IMAGE="ghcr.io/${OWNER,,}/${NAME,,}"; TARGET_NAME="${NAME,,}"
+                  printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${TARGET_NAME}" "${TAGS}" >> "${PACKAGE_OUT}"
+                  echo "发现关联 GitHub Package：${SOURCE_IMAGE}；标签=${TAGS}"
+                fi
+              done
+            else
+              echo "::warning::无法枚举 GitHub Packages，继续使用源码扫描结果：$(cat "${WORK}/packages.err")"
+            fi
+          fi
+          cat "${COMPOSE_OUT}" "${PACKAGE_OUT}" | awk -F '\t' '!seen[$1]++' > "${OUT}"
+          if [ ! -s "${OUT}" ] && [ "${SOURCE_KIND}" = "github" ]; then
+            printf 'ghcr.io/%s\t%s\t\n' "${SOURCE_REPO,,}" "${SOURCE_REPO#*/}" > "${OUT}"
+            echo "未发现明确镜像，回退到上游仓库同名 GHCR 镜像。"
+          fi
+          [ -s "${OUT}" ] || { echo "::error::未发现远程镜像或关联 GitHub Packages，请填写 image_mappings"; exit 1; }
           echo "map_file=${OUT}" >> "${GITHUB_OUTPUT}"
-          echo "自动发现结果："
-          cat "${OUT}"
+          echo "自动发现映射（第3列非空表示使用包自身标签）："; cat "${OUT}"
 
       - name: 生成镜像映射
         id: mappings
@@ -1096,9 +1085,9 @@ jobs:
           AUTH_MAP="${RUNNER_TEMP}/registry-auth.tsv"
           :>"${MAP}"; :>"${AUTH_MAP}"
           if [ -z "${IMAGE_MAPPINGS}" ]; then
-            [ -n "${AUTO_MAP_FILE}" ] && [ -s "${AUTO_MAP_FILE}" ]               || { echo "::error::Docker 地址栏为空且自动发现结果不可用"; exit 1; }
+            [ -n "${AUTO_MAP_FILE}" ] && [ -s "${AUTO_MAP_FILE}" ] || { echo "::error::Docker 地址栏为空且自动发现结果不可用"; exit 1; }
             cp "${AUTO_MAP_FILE}" "${MAP}"
-            echo "Docker 地址栏为空：使用上游项目自动发现的全部远程镜像。"
+            echo "Docker 地址栏为空：使用源码及 GitHub Packages 自动发现结果。"
           else
             while IFS= read -r item; do
               item="$(printf '%s' "${item}" | xargs)"; [ -n "${item}" ] || continue
@@ -1158,12 +1147,17 @@ jobs:
           [ "${MAP_COUNT}" -gt 0 ] || { echo "::error::没有生成 Docker 映射"; exit 1; }
           [ "${VERSION_COUNT}" -gt 0 ] || { echo "::error::没有选中 Docker 版本"; exit 1; }
           echo "准备搬运：镜像映射 ${MAP_COUNT} 个，精准版本 ${VERSION_COUNT} 个。"
-          echo "Docker 排序来源：tag_sync_mode=${TAG_SYNC_MODE}；prepare 输出数量=${SELECTED_COUNT}。"
-          echo "Docker 实际处理顺序："
-          jq -r '.[].tagName' "${VERSIONS}" | nl -ba
           OK=0; SKIP=0; MISSING=0; FAIL=0
-          while IFS=$'\t' read -r source_image target_name; do
+          while IFS=$'\t' read -r source_image target_name package_tags; do
             target_image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${target_name}"; last=""
+            TAG_FILE="${RUNNER_TEMP}/tags-$(printf '%s' "${target_name}" | tr '/:' '--').txt"
+            if [ -n "${package_tags:-}" ]; then
+              printf '%s' "${package_tags}" | tr ',' '\n' | sed '/^$/d' | sort -V > "${TAG_FILE}"
+              echo "${source_image} 使用 GitHub Package 自身标签，共 $(wc -l < "${TAG_FILE}" | xargs) 个。"
+            else
+              jq -r '.[].tagName' "${VERSIONS}" > "${TAG_FILE}"
+              echo "${source_image} 使用 Release/clean_snapshot 版本列表。"
+            fi
             while IFS= read -r release_tag; do
               [ -n "${release_tag}" ] || continue
               target_ref="${target_image}:${release_tag}"
@@ -1176,12 +1170,9 @@ jobs:
                 if crane manifest "${ref}" >/dev/null 2>&1; then source_ref="${ref}"; break; fi
               done
               if [ -z "${source_ref}" ]; then echo "缺失（已匹配）：${checked}" >> "${SUMMARY}"; MISSING=$((MISSING+1)); continue; fi
-              if [ "${SKIP_EXISTING}" = true ] && crane manifest "${target_ref}" >/dev/null 2>&1; then
-                echo "跳过 ${target_ref}；latest 候选=${source_ref}" >> "${SUMMARY}"
-                last="${source_ref}"; SKIP=$((SKIP+1)); continue
-              fi
+              if [ "${SKIP_EXISTING}" = true ] && crane manifest "${target_ref}" >/dev/null 2>&1; then echo "跳过 ${target_ref}；latest 候选=${source_ref}" >> "${SUMMARY}"; last="${source_ref}"; SKIP=$((SKIP+1)); continue; fi
               if crane copy "${source_ref}" "${target_ref}"; then echo "成功 ${source_ref} -> ${target_ref}" >> "${SUMMARY}"; last="${source_ref}"; OK=$((OK+1)); else echo "失败 ${source_ref}" >> "${SUMMARY}"; FAIL=$((FAIL+1)); fi
-            done < <(jq -r '.[].tagName' "${VERSIONS}")
+            done < "${TAG_FILE}"
             if [ "${UPDATE_LATEST}" = true ] && [ -n "${last}" ]; then
               if crane copy "${last}" "${target_image}:latest"; then echo "latest 更新成功：${last} -> ${target_image}:latest" >> "${SUMMARY}"; else echo "latest 更新失败：${last} -> ${target_image}:latest" >> "${SUMMARY}"; FAIL=$((FAIL+1)); fi
             fi
