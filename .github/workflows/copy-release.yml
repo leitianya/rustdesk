@@ -1048,29 +1048,96 @@ jobs:
           PYCODE
 
           if [ "${SOURCE_KIND}" = "github" ]; then
-            OWNER="${SOURCE_REPO%%/*}"; OWNER_TYPE="$(gh api "repos/${SOURCE_REPO}" --jq '.owner.type')"
-            if [ "${OWNER_TYPE}" = "Organization" ]; then PKG_ENDPOINT="/orgs/${OWNER}/packages"; else PKG_ENDPOINT="/users/${OWNER}/packages"; fi
-            if gh api --paginate --slurp "${PKG_ENDPOINT}?package_type=container&per_page=100" > "${WORK}/packages.json" 2>"${WORK}/packages.err"; then
-              jq -c --arg repo "${SOURCE_REPO}" '[.[][] | select((.repository.full_name // "") == $repo)] | unique_by(.name) | .[]' "${WORK}/packages.json" | while IFS= read -r package; do
-                NAME="$(jq -r '.name' <<<"${package}")"; ENCODED="$(jq -rn --arg v "${NAME}" '$v|@uri')"
-                if gh api --paginate --slurp "${PKG_ENDPOINT}/container/${ENCODED}/versions?per_page=100" > "${WORK}/versions.json" 2>/dev/null; then
-                  TAGS="$(jq -r '[.[][] | .metadata.container.tags[]?] | unique | sort_by(if .=="latest" then "zzzzzz" else . end) | join(",")' "${WORK}/versions.json")"
-                  [ -n "${TAGS}" ] || { echo "GitHub Package 无标签，跳过：${NAME}"; continue; }
-                  SOURCE_IMAGE="ghcr.io/${OWNER,,}/${NAME,,}"; TARGET_NAME="${NAME,,}"
-                  printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${TARGET_NAME}" "${TAGS}" >> "${PACKAGE_OUT}"
-                  echo "发现关联 GitHub Package：${SOURCE_IMAGE}；标签=${TAGS}"
-                fi
-              done
+            OWNER="${SOURCE_REPO%%/*}"
+            REPO_NAME="${SOURCE_REPO#*/}"
+            OWNER_TYPE="$(gh api "repos/${SOURCE_REPO}" --jq '.owner.type')"
+            if [ "${OWNER_TYPE}" = "Organization" ]; then
+              PKG_ENDPOINT="/orgs/${OWNER}/packages"
+              PUBLIC_ENDPOINT="https://api.github.com/orgs/${OWNER}/packages"
             else
-              echo "::warning::无法枚举 GitHub Packages，继续使用源码扫描结果：$(cat "${WORK}/packages.err")"
+              PKG_ENDPOINT="/users/${OWNER}/packages"
+              PUBLIC_ENDPOINT="https://api.github.com/users/${OWNER}/packages"
+            fi
+
+            PACKAGES_OK=false
+            if gh api --paginate --slurp "${PKG_ENDPOINT}?package_type=container&per_page=100" > "${WORK}/packages.json" 2>"${WORK}/packages.err"; then
+              PACKAGES_OK=true
+              echo "使用当前 Token 枚举 GitHub Packages 成功。"
+            else
+              echo "::warning::当前 Token 无法枚举上游 Packages，自动改用匿名公共 API。"
+              :>"${WORK}/packages-flat.jsonl"
+              for page in $(seq 1 50); do
+                CODE="$(curl -sS -L -o "${WORK}/packages-page.json" -w '%{http_code}' \
+                  -H 'Accept: application/vnd.github+json' \
+                  -H 'X-GitHub-Api-Version: 2022-11-28' \
+                  "${PUBLIC_ENDPOINT}?package_type=container&per_page=100&page=${page}")"
+                [ "${CODE}" = 200 ] || { echo "匿名 Packages API HTTP ${CODE}"; break; }
+                COUNT="$(jq length "${WORK}/packages-page.json")"
+                [ "${COUNT}" -gt 0 ] || break
+                jq -c '.[]' "${WORK}/packages-page.json" >> "${WORK}/packages-flat.jsonl"
+                [ "${COUNT}" -lt 100 ] && break
+              done
+              if [ -s "${WORK}/packages-flat.jsonl" ]; then
+                jq -s '.' "${WORK}/packages-flat.jsonl" | jq -s '.' > "${WORK}/packages.json"
+                PACKAGES_OK=true
+                echo "匿名公共 API 枚举 GitHub Packages 成功。"
+              fi
+            fi
+
+            if [ "${PACKAGES_OK}" = true ]; then
+              jq -c --arg repo "${SOURCE_REPO}" --arg prefix "${REPO_NAME}/" '
+                [.[][]
+                  | select(
+                      ((.repository.full_name // "") | ascii_downcase) == ($repo | ascii_downcase)
+                      or (.name | ascii_downcase | startswith($prefix | ascii_downcase))
+                    )
+                ] | unique_by(.name) | .[]
+              ' "${WORK}/packages.json" > "${WORK}/selected-packages.jsonl"
+              FOUND_PACKAGES="$(wc -l < "${WORK}/selected-packages.jsonl" | xargs)"
+              echo "与 ${SOURCE_REPO} 关联或以 ${REPO_NAME}/ 开头的 Container Packages：${FOUND_PACKAGES} 个。"
+
+              while IFS= read -r package; do
+                [ -n "${package}" ] || continue
+                NAME="$(jq -r '.name' <<<"${package}")"
+                ENCODED="$(jq -rn --arg v "${NAME}" '$v|@uri')"
+                VERSIONS_OK=false
+                if gh api --paginate --slurp "${PKG_ENDPOINT}/container/${ENCODED}/versions?per_page=100" > "${WORK}/versions.json" 2>/dev/null; then
+                  VERSIONS_OK=true
+                else
+                  :>"${WORK}/versions-flat.jsonl"
+                  for page in $(seq 1 50); do
+                    CODE="$(curl -sS -L -o "${WORK}/versions-page.json" -w '%{http_code}' \
+                      -H 'Accept: application/vnd.github+json' \
+                      -H 'X-GitHub-Api-Version: 2022-11-28' \
+                      "${PUBLIC_ENDPOINT}/container/${ENCODED}/versions?per_page=100&page=${page}")"
+                    [ "${CODE}" = 200 ] || break
+                    COUNT="$(jq length "${WORK}/versions-page.json")"
+                    [ "${COUNT}" -gt 0 ] || break
+                    jq -c '.[]' "${WORK}/versions-page.json" >> "${WORK}/versions-flat.jsonl"
+                    [ "${COUNT}" -lt 100 ] && break
+                  done
+                  if [ -s "${WORK}/versions-flat.jsonl" ]; then
+                    jq -s '.' "${WORK}/versions-flat.jsonl" | jq -s '.' > "${WORK}/versions.json"
+                    VERSIONS_OK=true
+                  fi
+                fi
+                if [ "${VERSIONS_OK}" != true ]; then
+                  echo "::warning::无法读取包版本，跳过：${NAME}"
+                  continue
+                fi
+                TAGS="$(jq -r '[.[][] | .metadata.container.tags[]?] | unique | sort_by(if .=="latest" then "zzzzzz" else . end) | join(",")' "${WORK}/versions.json")"
+                [ -n "${TAGS}" ] || { echo "GitHub Package 无标签，跳过：${NAME}"; continue; }
+                SOURCE_IMAGE="ghcr.io/${OWNER,,}/${NAME,,}"
+                TARGET_NAME="${NAME,,}"
+                printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${TARGET_NAME}" "${TAGS}" >> "${PACKAGE_OUT}"
+                echo "发现关联 GitHub Package：${SOURCE_IMAGE}；标签=${TAGS}"
+              done < "${WORK}/selected-packages.jsonl"
+            else
+              echo "::warning::认证及匿名方式均无法枚举 GitHub Packages。认证错误：$(cat "${WORK}/packages.err" 2>/dev/null || true)"
             fi
           fi
-          cat "${COMPOSE_OUT}" "${PACKAGE_OUT}" | awk -F '\t' '!seen[$1]++' > "${OUT}"
-          if [ ! -s "${OUT}" ] && [ "${SOURCE_KIND}" = "github" ]; then
-            printf 'ghcr.io/%s\t%s\t\n' "${SOURCE_REPO,,}" "${SOURCE_REPO#*/}" > "${OUT}"
-            echo "未发现明确镜像，回退到上游仓库同名 GHCR 镜像。"
-          fi
-          [ -s "${OUT}" ] || { echo "::error::未发现远程镜像或关联 GitHub Packages，请填写 image_mappings"; exit 1; }
+          cat "${PACKAGE_OUT}" "${COMPOSE_OUT}" | awk -F '\t' '!seen[$1]++' > "${OUT}"
+          [ -s "${OUT}" ] || { echo "::error::没有从源码或 GitHub Packages 读取到镜像。若上游包公开但仍失败，请为 WORKFLOW_PAT 添加 classic read:packages；也可手动填写 image_mappings"; exit 1; }
           echo "map_file=${OUT}" >> "${GITHUB_OUTPUT}"
           echo "自动发现映射（第3列非空表示使用包自身标签）："; cat "${OUT}"
 
