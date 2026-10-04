@@ -1084,6 +1084,51 @@ jobs:
               fi
             fi
 
+            # Packages REST API 对公开包也可能要求 classic read:packages。
+            # API 认证和匿名请求都失败时，从公开 GitHub Packages 网页发现包名，
+            # 再直接用 crane ls 从 GHCR 读取真实标签，不依赖 Packages REST 权限。
+            WEB_PACKAGES="${WORK}/web-packages.txt"
+            :>"${WEB_PACKAGES}"
+            if [ "${PACKAGES_OK}" != true ]; then
+              echo "REST API 不可用，开始抓取公开 Packages 网页。"
+              for page in $(seq 1 50); do
+                PAGE_URL="https://github.com/orgs/${OWNER}/packages?repo_name=${REPO_NAME}&page=${page}"
+                CODE="$(curl -sS -L -o "${WORK}/packages-page.html" -w '%{http_code}' \
+                  -H 'Accept: text/html' -A 'Mozilla/5.0' "${PAGE_URL}")"
+                [ "${CODE}" = 200 ] || { echo "Packages 网页 HTTP ${CODE}：${PAGE_URL}"; break; }
+                python3 - "${WORK}/packages-page.html" "${OWNER}" "${REPO_NAME}" >> "${WEB_PACKAGES}" <<'PYWEB'
+              import html, re, sys
+              from pathlib import Path
+              from urllib.parse import unquote
+              text=html.unescape(Path(sys.argv[1]).read_text(encoding='utf-8',errors='ignore'))
+              owner,repo=sys.argv[2],sys.argv[3]
+              pattern=rf'/{re.escape(owner)}/{re.escape(repo)}/pkgs/container/([^"?#< ]+)'
+              for raw in re.findall(pattern,text,re.I):
+                  name=unquote(raw).strip('/')
+                  if name: print(name)
+              PYWEB
+                COUNT="$(sort -u "${WEB_PACKAGES}" | wc -l | xargs)"
+                echo "Packages 网页第 ${page} 页，累计发现 ${COUNT} 个包。"
+                grep -qiE 'Next|下一页' "${WORK}/packages-page.html" || break
+              done
+              sort -u "${WEB_PACKAGES}" -o "${WEB_PACKAGES}"
+              if [ -s "${WEB_PACKAGES}" ]; then
+                echo "公开 Packages 网页发现包：$(wc -l < "${WEB_PACKAGES}" | xargs) 个。"
+                while IFS= read -r NAME; do
+                  [ -n "${NAME}" ] || continue
+                  SOURCE_IMAGE="ghcr.io/${OWNER,,}/${NAME,,}"
+                  TAGS="$(crane ls "${SOURCE_IMAGE}" 2>/dev/null | sort -V | paste -sd, - || true)"
+                  if [ -z "${TAGS}" ]; then
+                    # 页面顶部会明确显示 latest；crane ls 被限流时仍先保留 latest。
+                    TAGS="latest"
+                    echo "::warning::无法列出 ${SOURCE_IMAGE} 的标签，回退尝试 latest。"
+                  fi
+                  printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${NAME,,}" "${TAGS}" >> "${PACKAGE_OUT}"
+                  echo "网页发现 GitHub Package：${SOURCE_IMAGE}；标签=${TAGS}"
+                done < "${WEB_PACKAGES}"
+              fi
+            fi
+
             if [ "${PACKAGES_OK}" = true ]; then
               jq -c --arg repo "${SOURCE_REPO}" --arg prefix "${REPO_NAME}/" '
                 [.[][]
@@ -1095,6 +1140,34 @@ jobs:
               ' "${WORK}/packages.json" > "${WORK}/selected-packages.jsonl"
               FOUND_PACKAGES="$(wc -l < "${WORK}/selected-packages.jsonl" | xargs)"
               echo "与 ${SOURCE_REPO} 关联或以 ${REPO_NAME}/ 开头的 Container Packages：${FOUND_PACKAGES} 个。"
+              if [ "${FOUND_PACKAGES}" -eq 0 ]; then
+                echo "::warning::Packages API 返回成功但没有关联包，补充抓取公开 Packages 网页。"
+                for page in $(seq 1 50); do
+                  PAGE_URL="https://github.com/orgs/${OWNER}/packages?repo_name=${REPO_NAME}&page=${page}"
+                  CODE="$(curl -sS -L -o "${WORK}/packages-page.html" -w '%{http_code}' -H 'Accept: text/html' -A 'Mozilla/5.0' "${PAGE_URL}")"
+                  [ "${CODE}" = 200 ] || break
+                  python3 - "${WORK}/packages-page.html" "${OWNER}" "${REPO_NAME}" >> "${WEB_PACKAGES}" <<'PYWEB2'
+                import html, re, sys
+                from pathlib import Path
+                from urllib.parse import unquote
+                text=html.unescape(Path(sys.argv[1]).read_text(encoding='utf-8',errors='ignore'))
+                pattern=rf'/{re.escape(sys.argv[2])}/{re.escape(sys.argv[3])}/pkgs/container/([^"?#< ]+)'
+                for raw in re.findall(pattern,text,re.I):
+                    name=unquote(raw).strip('/')
+                    if name: print(name)
+                PYWEB2
+                  grep -qiE 'Next|下一页' "${WORK}/packages-page.html" || break
+                done
+                sort -u "${WEB_PACKAGES}" -o "${WEB_PACKAGES}"
+                while IFS= read -r NAME; do
+                  [ -n "${NAME}" ] || continue
+                  SOURCE_IMAGE="ghcr.io/${OWNER,,}/${NAME,,}"
+                  TAGS="$(crane ls "${SOURCE_IMAGE}" 2>/dev/null | sort -V | paste -sd, - || true)"
+                  [ -n "${TAGS}" ] || TAGS="latest"
+                  printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${NAME,,}" "${TAGS}" >> "${PACKAGE_OUT}"
+                  echo "网页补充 GitHub Package：${SOURCE_IMAGE}；标签=${TAGS}"
+                done < "${WEB_PACKAGES}"
+              fi
 
               while IFS= read -r package; do
                 [ -n "${package}" ] || continue
