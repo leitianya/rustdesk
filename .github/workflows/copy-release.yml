@@ -1096,17 +1096,9 @@ jobs:
                 CODE="$(curl -sS -L -o "${WORK}/packages-page.html" -w '%{http_code}' \
                   -H 'Accept: text/html' -A 'Mozilla/5.0' "${PAGE_URL}")"
                 [ "${CODE}" = 200 ] || { echo "Packages 网页 HTTP ${CODE}：${PAGE_URL}"; break; }
-                python3 - "${WORK}/packages-page.html" "${OWNER}" "${REPO_NAME}" >> "${WEB_PACKAGES}" <<'PYWEB'
-              import html, re, sys
-              from pathlib import Path
-              from urllib.parse import unquote
-              text=html.unescape(Path(sys.argv[1]).read_text(encoding='utf-8',errors='ignore'))
-              owner,repo=sys.argv[2],sys.argv[3]
-              pattern=rf'/{re.escape(owner)}/{re.escape(repo)}/pkgs/container/([^"?#< ]+)'
-              for raw in re.findall(pattern,text,re.I):
-                  name=unquote(raw).strip('/')
-                  if name: print(name)
-              PYWEB
+                HTML_FILE="${WORK}/packages-page.html" OWNER_VALUE="${OWNER}" REPO_VALUE="${REPO_NAME}" \
+                  python3 -c 'import html,os,re; from pathlib import Path; from urllib.parse import unquote; text=html.unescape(Path(os.environ["HTML_FILE"]).read_text(encoding="utf-8",errors="ignore")); owner=os.environ["OWNER_VALUE"]; repo=os.environ["REPO_VALUE"]; pattern=rf"/{re.escape(owner)}/{re.escape(repo)}/pkgs/container/([^\"?#< ]+)"; print("\n".join(unquote(x).strip("/") for x in re.findall(pattern,text,re.I) if unquote(x).strip("/")))' \
+                  >> "${WEB_PACKAGES}"
                 COUNT="$(sort -u "${WEB_PACKAGES}" | wc -l | xargs)"
                 echo "Packages 网页第 ${page} 页，累计发现 ${COUNT} 个包。"
                 grep -qiE 'Next|下一页' "${WORK}/packages-page.html" || break
@@ -1146,16 +1138,9 @@ jobs:
                   PAGE_URL="https://github.com/orgs/${OWNER}/packages?repo_name=${REPO_NAME}&page=${page}"
                   CODE="$(curl -sS -L -o "${WORK}/packages-page.html" -w '%{http_code}' -H 'Accept: text/html' -A 'Mozilla/5.0' "${PAGE_URL}")"
                   [ "${CODE}" = 200 ] || break
-                  python3 - "${WORK}/packages-page.html" "${OWNER}" "${REPO_NAME}" >> "${WEB_PACKAGES}" <<'PYWEB2'
-                import html, re, sys
-                from pathlib import Path
-                from urllib.parse import unquote
-                text=html.unescape(Path(sys.argv[1]).read_text(encoding='utf-8',errors='ignore'))
-                pattern=rf'/{re.escape(sys.argv[2])}/{re.escape(sys.argv[3])}/pkgs/container/([^"?#< ]+)'
-                for raw in re.findall(pattern,text,re.I):
-                    name=unquote(raw).strip('/')
-                    if name: print(name)
-                PYWEB2
+                  HTML_FILE="${WORK}/packages-page.html" OWNER_VALUE="${OWNER}" REPO_VALUE="${REPO_NAME}" \
+                    python3 -c 'import html,os,re; from pathlib import Path; from urllib.parse import unquote; text=html.unescape(Path(os.environ["HTML_FILE"]).read_text(encoding="utf-8",errors="ignore")); owner=os.environ["OWNER_VALUE"]; repo=os.environ["REPO_VALUE"]; pattern=rf"/{re.escape(owner)}/{re.escape(repo)}/pkgs/container/([^\"?#< ]+)"; print("\n".join(unquote(x).strip("/") for x in re.findall(pattern,text,re.I) if unquote(x).strip("/")))' \
+                    >> "${WEB_PACKAGES}"
                   grep -qiE 'Next|下一页' "${WORK}/packages-page.html" || break
                 done
                 sort -u "${WEB_PACKAGES}" -o "${WEB_PACKAGES}"
